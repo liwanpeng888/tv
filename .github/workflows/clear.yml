@@ -19,7 +19,7 @@ jobs:
     steps:
       # 步骤1：克隆仓库（浅克隆，仅拉取最新代码，提高速度）
       - name: Checkout latest code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
         with:
           ref: ${{ github.event.inputs.target_branch }}
           fetch-depth: 1 # 浅克隆，只取最新提交
