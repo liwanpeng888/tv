@@ -219,38 +219,61 @@ class AccurateStreamChecker:
         return cleaned
 
     def batch_check(self, lines: List[str], whitelist: Set[str]) -> Tuple[List[Tuple[str, float]], List[str]]:
-        success = []
-        failed = []
+        success = []  # 包含所有白名单（无论是否有效）+ 非白名单有效链接
+        failed = []   # 仅非白名单失败链接
         logger.info(f"开始检测 {len(lines)} 个链接的有效性")
-
+    
         with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
             futures = {}
+            # 提交所有待检测链接（包括白名单）的检测任务
             for line in lines:
                 if ',' in line:
                     _, url = line.split(',', 1)
                     url = url.strip()
                     futures[executor.submit(self.check_url, url)] = (line, url)
-
+    
             processed = 0
             for future in as_completed(futures):
                 line, url = futures[future]
                 processed += 1
                 try:
                     is_valid, resp_time = future.result()
+                    
+                    # 白名单链接：无论是否有效，都加入success
+                    # 有效时用真实响应时间，无效时用0.00
                     if url in whitelist:
-                        success.append((line, 0.00))
+                        if is_valid:
+                            success.append((line, resp_time))
+                            logger.debug(f"白名单链接有效: {url} | {resp_time}ms")
+                        else:
+                            # 白名单失败：响应时间设为0.00，不加入failed
+                            success.append((line, 0.00))
+                            logger.warning(f"白名单链接检测失败，设为0.00ms: {url}")
+                    # 非白名单链接：有效则加入success，无效则加入failed
                     elif is_valid:
                         success.append((line, resp_time))
                     else:
                         failed.append(line)
-                except:
-                    failed.append(line)
+                        
+                except Exception as e:
+                    # 异常处理：白名单设为0.00且不加入failed，非白名单加入failed
+                    if url in whitelist:
+                        success.append((line, 0.00))
+                        logger.error(f"白名单链接检测异常，设为0.00ms: {url} | 错误: {e}")
+                    else:
+                        failed.append(line)
                 
                 if processed % 100 == 0 or processed == len(lines):
-                    logger.info(f"进度: {processed}/{len(lines)} | 有效: {len(success)} | 无效: {len(failed)}")
-
+                    logger.info(f"进度: {processed}/{len(lines)} | 有效/白名单: {len(success)} | 无效: {len(failed)}")
+    
+        # 按响应时间排序（0.00的会在最前面）
         success_sorted = sorted(success, key=lambda x: x[1])
-        logger.info(f"有效性检测完成 - 有效链接 {len(success)} 个 | 无效链接 {len(failed)} 个")
+        
+        # 统计信息
+        valid_count = sum(1 for _, resp_time in success if resp_time > 0)
+        whitelist_failed_count = len(success) - valid_count
+        logger.info(f"有效性检测完成 - 有效链接 {valid_count} 个 | 白名单失败(0.00ms) {whitelist_failed_count} 个 | 非白名单无效 {len(failed)} 个")
+        
         return success_sorted, failed
 
     def save_results(self, success: List[Tuple[str, float]], failed: List[str]):
