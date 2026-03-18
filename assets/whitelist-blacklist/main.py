@@ -19,7 +19,7 @@ from urllib.parse import urlparse, quote, unquote
 import socket
 import ssl
 import re
-from typing import List, Tuple, Set
+from typing import List, Tuple, Set, Dict
 import logging
 
 # 获取文件路径
@@ -93,7 +93,7 @@ class StreamChecker:
                         # 提取URL（可能是"失败次数,时间,URL"格式或直接URL）
                         if ',' in line:
                             parts = line.split(',')
-                            url = parts[-1].strip()  # 取最后一部分作为URL
+                            url = parts[-1].strip()
                         else:
                             url = line
                         
@@ -112,38 +112,42 @@ class StreamChecker:
         try:
             # 读取现有内容
             existing_lines = []
+            has_header = False
             if os.path.exists(FILE_PATHS["blacklist_auto"]):
                 with open(FILE_PATHS["blacklist_auto"], 'r', encoding='utf-8') as f:
                     existing_lines = [line.rstrip('\n') for line in f]
+                    # 检查是否已有头部
+                    for line in existing_lines[:3]:
+                        if line.startswith('更新时间') or line.startswith('blacklist'):
+                            has_header = True
             
             # 生成新的黑名单条目
-            new_lines = []
-            for url in self.new_failed_urls:
-                # 格式: 失败次数,时间戳,URL (简单版本只存URL)
-                new_lines.append(url)
-            
-            # 合并去重
-            all_urls = set()
             all_content = []
             
-            # 保留头部
+            # 添加头部（如果没有）
+            if not has_header:
+                bj_time = datetime.now(timezone.utc) + timedelta(hours=8)
+                version = f"{bj_time.strftime('%Y%m%d %H:%M')},url"
+                all_content.extend(["更新时间,#genre#", version, "", "blacklist,#genre#"])
+            
+            # 合并现有内容（去重）
+            existing_urls = set()
             for line in existing_lines:
-                if line.startswith('更新时间') or line.startswith('blacklist'):
-                    all_content.append(line)
-                else:
+                if line and not line.startswith('更新时间') and not line.startswith('blacklist') and not line == '':
                     # 提取URL
                     if ',' in line:
                         url = line.split(',')[-1].strip()
                     else:
-                        url = line
-                    if url not in all_urls:
-                        all_urls.add(url)
-                        all_content.append(line)
+                        url = line.strip()
+                    if url and '://' in url:
+                        if url not in existing_urls:
+                            existing_urls.add(url)
+                            all_content.append(line)
             
             # 添加新链接
-            for url in new_lines:
-                if url not in all_urls:
-                    all_urls.add(url)
+            for url in self.new_failed_urls:
+                if url not in existing_urls:
+                    existing_urls.add(url)
                     all_content.append(url)
             
             # 写入文件
@@ -152,7 +156,7 @@ class StreamChecker:
                 f.write('\n'.join(all_content))
             
             logger.info(f"黑名单已更新: 新增 {len(self.new_failed_urls)} 个失败链接")
-            logger.info(f"黑名单总数: {len(all_urls)} 个")
+            logger.info(f"黑名单总数: {len(existing_urls)} 个")
             
         except Exception as e:
             logger.error(f"保存黑名单失败: {e}")
@@ -321,12 +325,14 @@ class StreamChecker:
     def prepare_lines(self, lines):
         """
         准备待检测行：
-        1. 已在黑名单中的直接标记为失败（不检测）
-        2. 返回需要检测的链接和预失败的链接
+        返回: 
+            to_check: List[Tuple[str, str]] 需要检测的链接 (url, line)
+            pre_failed: List[str] 黑名单中已有的链接（直接失败）
+            url_to_line: Dict[str, str] URL到完整行的映射
         """
-        to_check = []        # 需要检测的链接
-        pre_failed = []      # 黑名单中已有的链接（直接失败）
-        url_to_line = {}      # URL到完整行的映射
+        to_check = []
+        pre_failed = []
+        url_to_line = {}
         
         blacklist_skip = 0
         for line in lines:
@@ -337,18 +343,15 @@ class StreamChecker:
             url = url.strip().split('#')[0].split('$')[0]
             
             # 保存映射
-            url_to_line[url] = f"{name},{url}"
+            full_line = f"{name},{url}"
+            url_to_line[url] = full_line
             
-            # 检查是否在黑名单中
-            if url in self.blacklist_urls:
-                # 黑名单中的链接直接判定失败
-                if url not in self.whitelist_urls:  # 白名单除外
-                    pre_failed.append((url, line))
-                    blacklist_skip += 1
-                    continue
-            
-            # 需要检测的链接
-            to_check.append((url, line))
+            # 检查是否在黑名单中（且不是白名单）
+            if url in self.blacklist_urls and url not in self.whitelist_urls:
+                pre_failed.append(full_line)
+                blacklist_skip += 1
+            else:
+                to_check.append((url, full_line))
         
         logger.info(f"黑名单直接跳过: {blacklist_skip} 个")
         logger.info(f"需要检测: {len(to_check)} 个")
@@ -356,9 +359,12 @@ class StreamChecker:
         return to_check, pre_failed, url_to_line
 
     def batch_check(self, to_check, url_to_line):
-        """批量检测（只检测需要检测的链接）"""
-        success = []  # 所有白名单 + 有效链接
-        failed = []   # 非白名单失败（新发现的）
+        """
+        批量检测
+        to_check: List[Tuple[url, line]] 需要检测的链接
+        """
+        success = []  # 所有白名单 + 有效链接 (line, resp_time)
+        failed = []   # 非白名单失败（新发现的）(line)
         
         total = len(to_check)
         logger.info(f"开始检测 {total} 个链接")
@@ -378,20 +384,20 @@ class StreamChecker:
                     is_valid, resp_time = future.result()
                     
                     if is_valid:
-                        success.append((url_to_line[url], resp_time))
+                        success.append((line, resp_time))
                     else:
                         if is_whitelist:
                             # 白名单失败：显示0.00ms，不加入黑名单
-                            success.append((url_to_line[url], 0.00))
+                            success.append((line, 0.00))
                         else:
                             # 非白名单失败：加入黑名单
-                            failed.append(url_to_line[url])
+                            failed.append(line)
                             self.new_failed_urls.add(url)
-                except:
+                except Exception as e:
                     if is_whitelist:
-                        success.append((url_to_line[url], 0.00))
+                        success.append((line, 0.00))
                     else:
-                        failed.append(url_to_line[url])
+                        failed.append(line)
                         self.new_failed_urls.add(url)
                 
                 if processed % 50 == 0:
@@ -412,19 +418,32 @@ class StreamChecker:
 
         # 带响应时间（所有白名单 + 有效链接）
         resp_lines = [
-            "更新时间,#genre#", version, "", "响应时间,名称,URL,#genre#"
-        ] + [f"{t:.2f}ms,{line}" for line, t in success]
+            "更新时间,#genre#", 
+            version, 
+            "", 
+            "响应时间,名称,URL,#genre#"
+        ]
+        for line, resp_time in success:
+            resp_lines.append(f"{resp_time:.2f}ms,{line}")
         
         # 纯净列表（所有白名单 + 有效链接）
         clean_lines = [
-            "更新时间,#genre#", version, "", "直播源,#genre#"
-        ] + [line for line, _ in success]
+            "更新时间,#genre#", 
+            version, 
+            "", 
+            "直播源,#genre#"
+        ]
+        clean_lines.extend([line for line, _ in success])
         
         # 失败列表（新发现的失败 + 黑名单预失败的）
-        all_failed = failed + [line for _, line in pre_failed]
+        all_failed = failed + pre_failed
         fail_lines = [
-            "更新时间,#genre#", version, "", "失败链接,#genre#"
-        ] + all_failed
+            "更新时间,#genre#", 
+            version, 
+            "", 
+            "失败链接,#genre#"
+        ]
+        fail_lines.extend(all_failed)
 
         # 写入文件
         self._write_file(FILE_PATHS["whitelist_respotime"], resp_lines)
