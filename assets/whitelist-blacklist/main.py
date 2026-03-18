@@ -303,7 +303,6 @@ class AccurateStreamChecker:
                         # 白名单链接：失败则响应时间设为0.00，仍加入success
                         if url in whitelist:
                             success.append((line, 0.00))
-                            logger.warning(f"白名单链接检测失败，设为0.00ms: {url}")
                         # 非白名单链接：失败则加入failed
                         else:
                             failed.append(line)
